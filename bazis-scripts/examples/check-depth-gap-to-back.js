@@ -1,24 +1,29 @@
 /**
  * Базис-Мебельщик 2025 x64
  *
- * Проверка: внутренние горизонтальные панели (полки и т.п.)
- * не доходят до задней стенки после смены глубины корпуса.
+ * Проверка: внутренние элементы не доходят до задней стенки
+ * после смены глубины корпуса.
  *
- * v1-логика:
- *  1) собрать панели модели (или выделенного блока, если есть Selected)
- *  2) найти «заднюю» — вертикальную панель у максимальной координаты по оси глубины
- *  3) для горизонтальных панелей посчитать зазор тыла до передней пласти задней
- *  4) если gap > MAX_GAP_MM — выделить и показать в отчёте
+ * Кандидаты:
+ *  - полки / горизонтальные панели (нормаль ≈ Z)
+ *  - вертикальные стойки (нормаль ≈ ось ширины, но НЕ крайние бока)
  *
- * Настрой под свой конструктор:
- *  - DEPTH_AXIS: 'x' | 'y' (ось глубины в ГСК для типовой постановки модели)
- *  - MAX_GAP_MM: допустимый зазор полки до задней
- *  - SKIP_NAME_RE: имена, которые пропускаем (ящики и т.п.)
+ * Не кандидаты: бока, задняя, фасады, ящики (по имени).
+ *
+ * Настройки:
+ *  - DEPTH_AXIS: 'x' | 'y'
+ *  - MAX_GAP_MM: допуск зазора
+ *  - SIDE_EDGE_TOL_MM: насколько близко к краю ширины считать панель боком
+ *  - SKIP_NAME_RE: что пропускать
  */
 
-const DEPTH_AXIS = 'y'; // чаще глубина шкафа в Базисе — Y; поменяй при необходимости
-const MAX_GAP_MM = 8; // всё, что больше — считаем «не доходит»
+const DEPTH_AXIS = 'y';
+const MAX_GAP_MM = 8;
+const SIDE_EDGE_TOL_MM = 2; // панель у края габарита по ширине = бок, не стойка
 const SKIP_NAME_RE = /ящик|box|drawer|фасад|двер/i;
+const BACK_INNER_IS_MIN = true; // лицо корпуса на меньших координатах по DEPTH_AXIS
+
+const WIDTH_AXIS = DEPTH_AXIS === 'y' ? 'x' : 'y';
 
 function walkObjectList(list, visitor) {
     if (!list || typeof list.Count !== 'number') return;
@@ -35,7 +40,6 @@ function isPanel(obj) {
 }
 
 function axisOfNormal(panel) {
-    // куда «смотрит» лицевая пласть в ГСК
     const n = panel.NToGlobal(AxisZ);
     const ax = Math.abs(n.x);
     const ay = Math.abs(n.y);
@@ -46,10 +50,7 @@ function axisOfNormal(panel) {
 }
 
 function gab(panel) {
-    return {
-        min: panel.GabMin,
-        max: panel.GabMax,
-    };
+    return { min: panel.GabMin, max: panel.GabMax };
 }
 
 function center(panel) {
@@ -68,17 +69,8 @@ function selectObjects(model, objects) {
 }
 
 function shouldSkip(panel) {
-    const name = panel.Name || '';
-    return SKIP_NAME_RE.test(name);
+    return SKIP_NAME_RE.test(panel.Name || '');
 }
-
-/**
- * Передняя (внутренняя) координата задней стенки по оси глубины.
- * Считаем, что «лицо» корпуса — меньшая координата по DEPTH_AXIS,
- * «тыл» — большая. Тогда внутренняя пласть задней ≈ min по этой оси у задней панели.
- * Если у тебя модель зеркально — инвертируй BACK_FACES_SMALLER.
- */
-const BACK_INNER_IS_MIN = true;
 
 function backInnerCoord(backPanel) {
     const g = gab(backPanel);
@@ -86,9 +78,13 @@ function backInnerCoord(backPanel) {
 }
 
 function panelRearCoord(panel) {
-    // тыл внутреннего элемента — край, ближайший к задней (= больший по оси глубины)
     const g = gab(panel);
     return BACK_INNER_IS_MIN ? g.max[DEPTH_AXIS] : g.min[DEPTH_AXIS];
+}
+
+function gapToBack(panel, backPlane) {
+    const rear = panelRearCoord(panel);
+    return BACK_INNER_IS_MIN ? backPlane - rear : rear - backPlane;
 }
 
 function collectPanels(root) {
@@ -99,6 +95,72 @@ function collectPanels(root) {
     return panels;
 }
 
+/**
+ * Габарит модуля по ширине — по всем панелям с нормалью ширины
+ * (бока + стойки). Края этого габарита = бока.
+ */
+function widthExtent(widthPanels) {
+    let minW = Infinity;
+    let maxW = -Infinity;
+    for (let i = 0; i < widthPanels.length; i++) {
+        const g = gab(widthPanels[i]);
+        if (g.min[WIDTH_AXIS] < minW) minW = g.min[WIDTH_AXIS];
+        if (g.max[WIDTH_AXIS] > maxW) maxW = g.max[WIDTH_AXIS];
+    }
+    return { minW, maxW };
+}
+
+function isSidePanel(panel, minW, maxW) {
+    const g = gab(panel);
+    const nearMin = Math.abs(g.min[WIDTH_AXIS] - minW) <= SIDE_EDGE_TOL_MM;
+    const nearMax = Math.abs(g.max[WIDTH_AXIS] - maxW) <= SIDE_EDGE_TOL_MM;
+    return nearMin || nearMax;
+}
+
+/**
+ * @returns {{ panel: any, role: string, gap: number, name: string }[]}
+ */
+function findProblems(panels, back, backPlane) {
+    const widthPanels = panels.filter(
+        (p) => p !== back && axisOfNormal(p) === WIDTH_AXIS && !shouldSkip(p)
+    );
+    const { minW, maxW } = widthExtent(widthPanels);
+
+    const candidates = [];
+
+    // Полки / горизонталь
+    for (let i = 0; i < panels.length; i++) {
+        const p = panels[i];
+        if (p === back || shouldSkip(p)) continue;
+        if (axisOfNormal(p) === 'z') {
+            candidates.push({ panel: p, role: 'полка' });
+        }
+    }
+
+    // Стойки: та же ориентация, что бока, но не на краю ширины
+    for (let i = 0; i < widthPanels.length; i++) {
+        const p = widthPanels[i];
+        if (isSidePanel(p, minW, maxW)) continue;
+        candidates.push({ panel: p, role: 'стойка' });
+    }
+
+    const problems = [];
+    for (let i = 0; i < candidates.length; i++) {
+        const { panel, role } = candidates[i];
+        const gap = gapToBack(panel, backPlane);
+        if (gap > MAX_GAP_MM) {
+            problems.push({
+                panel,
+                role,
+                gap,
+                name: panel.Name || '(без имени)',
+            });
+        }
+    }
+
+    return { problems, candidateCount: candidates.length, shelfCount: candidates.filter((c) => c.role === 'полка').length, uprightCount: candidates.filter((c) => c.role === 'стойка').length };
+}
+
 (function main() {
     const model = currentFileData && currentFileData.model;
     if (!model) {
@@ -106,8 +168,6 @@ function collectPanels(root) {
         return;
     }
 
-    // Если что-то выделено и у объекта есть List — обходим его как модуль.
-    // Иначе — всю модель.
     let root = model;
     const selected = model.Selected || model.SelectedObj;
     if (selected && selected.List) root = selected;
@@ -118,7 +178,6 @@ function collectPanels(root) {
         return;
     }
 
-    // Кандидаты в «заднюю»: нормаль вдоль оси глубины
     const backCandidates = panels.filter((p) => axisOfNormal(p) === DEPTH_AXIS);
     if (!backCandidates.length) {
         UI.dialogs.ErrorBox(
@@ -128,7 +187,6 @@ function collectPanels(root) {
         return;
     }
 
-    // Берём самую «заднюю» по центру габарита
     backCandidates.sort((a, b) => {
         const ca = center(a)[DEPTH_AXIS];
         const cb = center(b)[DEPTH_AXIS];
@@ -137,30 +195,11 @@ function collectPanels(root) {
     const back = backCandidates[0];
     const backPlane = backInnerCoord(back);
 
-    // Внутренние: горизонтальные (нормаль ≈ Z), не задняя, не пропущенные по имени
-    const internals = panels.filter((p) => {
-        if (p === back) return false;
-        if (shouldSkip(p)) return false;
-        return axisOfNormal(p) === 'z';
-    });
-
-    const problems = [];
-    for (let i = 0; i < internals.length; i++) {
-        const panel = internals[i];
-        const rear = panelRearCoord(panel);
-        // не доходит: тыл панели не дотягивает до внутренней пласти задней
-        const gap = BACK_INNER_IS_MIN
-            ? backPlane - rear
-            : rear - backPlane;
-
-        if (gap > MAX_GAP_MM) {
-            problems.push({
-                panel,
-                gap,
-                name: panel.Name || '(без имени)',
-            });
-        }
-    }
+    const { problems, candidateCount, shelfCount, uprightCount } = findProblems(
+        panels,
+        back,
+        backPlane
+    );
 
     selectObjects(
         model,
@@ -169,10 +208,10 @@ function collectPanels(root) {
 
     if (!problems.length) {
         UI.dialogs.MessageBox(
-            `Проверка зазора до задней стенки\r\n` +
+            `Проверка зазора до задней\r\n` +
                 `Задняя: "${back.Name || '(без имени)'}"\r\n` +
-                `Горизонтальных внутри: ${internals.length}\r\n` +
-                `Проблем не найдено (допуск ${MAX_GAP_MM} мм).`
+                `Кандидатов: ${candidateCount} (полки ${shelfCount}, стойки ${uprightCount})\r\n` +
+                `Проблем нет (допуск ${MAX_GAP_MM} мм).`
         );
         return;
     }
@@ -182,7 +221,7 @@ function collectPanels(root) {
         .slice(0, 40)
         .map(
             (p, idx) =>
-                `${idx + 1}. ${p.name} — зазор ${p.gap.toFixed(1)} мм`
+                `${idx + 1}. [${p.role}] ${p.name} — ${p.gap.toFixed(1)} мм`
         )
         .join('\r\n');
     const more =
@@ -190,7 +229,8 @@ function collectPanels(root) {
 
     UI.dialogs.MessageBox(
         `Не доходят до задней "${back.Name || ''}"\r\n` +
-            `Проблемных: ${problems.length} (допуск ${MAX_GAP_MM} мм)\r\n\r\n` +
+            `Проблемных: ${problems.length} (допуск ${MAX_GAP_MM} мм)\r\n` +
+            `Проверено: полки ${shelfCount}, стойки ${uprightCount}\r\n\r\n` +
             `${lines}${more}\r\n\r\n` +
             `Эти панели выделены в модели.`
     );
