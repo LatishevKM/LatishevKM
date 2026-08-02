@@ -29,14 +29,23 @@
 | Выделение | `model.UnPickAll()` / `obj.Selected = true` | Показать найденные объекты |
 | Позиции | `arrangePositions` | Расстановка позиций/обозначений |
 
+## Главный кейс: зазор до задней стенки
+
+После смены глубины корпуса полки/начинка часто не доезжают до задней.
+Логика и допуски: `docs/depth-gap-check.md`  
+Черновик проверки: `examples/check-depth-gap-to-back.js`
+
 ## Структура
 
 ```text
 bazis-scripts/
+  docs/
+    depth-gap-check.md              — логика проверки зазора до задней
   lib/
     model-walk.js      — обход модели, фильтр панелей
     panel-butts.js     — проверка облицовки кромки
   examples/
+    check-depth-gap-to-back.js      — полки не доходят до задней
     select-panels-without-butts.js  — выделить панели без кромки
     panel-inventory-report.js       — отчёт по панелям модели
     arrange-positions-run.js        — расстановка позиций
